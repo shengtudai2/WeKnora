@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	infra_web_search "github.com/Tencent/WeKnora/internal/infrastructure/web_search"
 	"github.com/Tencent/WeKnora/internal/config"
+	infra_web_search "github.com/Tencent/WeKnora/internal/infrastructure/web_search"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/searchutil"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -105,7 +105,8 @@ func (s *WebSearchService) resolveProvider(
 			return nil, fmt.Errorf("web search provider not found: %s", providerID)
 		}
 
-		provider, err := s.registry.CreateProvider(string(entity.Provider), entity.Parameters)
+		params := mergeProxyFromWebSearchConfig(entity.Parameters, cfg)
+		provider, err := s.registry.CreateProvider(string(entity.Provider), params)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create provider %s (%s): %w", entity.Name, entity.Provider, err)
 		}
@@ -115,9 +116,9 @@ func (s *WebSearchService) resolveProvider(
 	// Backward compatibility: use the deprecated config.Provider field
 	if cfg.Provider != "" {
 		logger.Warnf(ctx, "Using deprecated WebSearchConfig.Provider field: %s. Please migrate to WebSearchProviderEntity.", cfg.Provider)
-		params := types.WebSearchProviderParameters{
+		params := mergeProxyFromWebSearchConfig(types.WebSearchProviderParameters{
 			APIKey: cfg.APIKey,
-		}
+		}, cfg)
 		provider, err := s.registry.CreateProvider(cfg.Provider, params)
 		if err != nil {
 			return nil, fmt.Errorf("web search provider %s is not available: %w", cfg.Provider, err)
@@ -126,6 +127,16 @@ func (s *WebSearchService) resolveProvider(
 	}
 
 	return nil, fmt.Errorf("no web search provider configured")
+}
+
+// mergeProxyFromWebSearchConfig applies cfg.ProxyURL over stored provider params when non-empty (call-time override).
+func mergeProxyFromWebSearchConfig(base types.WebSearchProviderParameters, cfg *types.WebSearchConfig) types.WebSearchProviderParameters {
+	if cfg != nil {
+		if pu := strings.TrimSpace(cfg.ProxyURL); pu != "" {
+			base.ProxyURL = pu
+		}
+	}
+	return base
 }
 
 // CompressWithRAG performs RAG-based compression using a temporary, hidden knowledge base.
@@ -216,8 +227,8 @@ func (s *WebSearchService) CompressWithRAG(
 	for _, q := range questions {
 		params := types.SearchParams{
 			QueryText:        q,
-			VectorThreshold:  0.5,
-			KeywordThreshold: 0.5,
+			VectorThreshold:  0.2,
+			KeywordThreshold: 0.2,
 			MatchCount:       matchCount,
 		}
 		results, err := kbSvc.HybridSearch(ctx, tempKBID, params)

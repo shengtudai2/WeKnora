@@ -42,6 +42,7 @@ const uploadInputRef = ref<HTMLInputElement | null>(null);
 const folderUploadInputRef = ref<HTMLInputElement | null>(null);
 const uploading = ref(false);
 const kbLoading = ref(false);
+const docListLoading = ref(true);
 const isFAQ = computed(() => (kbInfo.value?.type || '') === 'faq');
 const missingStorageEngine = computed(() => {
   if (!kbInfo.value || isFAQ.value) return false
@@ -165,7 +166,7 @@ const onVisibleChange = (visible: boolean) => {
   }
 };
 let isCardDetails = ref(false);
-let timeout: ReturnType<typeof setInterval> | null = null;
+let timeout: ReturnType<typeof setTimeout> | null = null;
 let delDialog = ref(false)
 let rebuildDialog = ref(false)
 let rebuildKnowledgeItem = ref<KnowledgeCard>({ id: '', parse_status: '' })
@@ -210,6 +211,11 @@ const fileTypeOptions = computed(() => [
   { content: 'MD', value: 'md' },
   { content: 'URL', value: 'url' },
   { content: t('knowledgeBase.typeManual'), value: 'manual' },
+  { content: 'MP3', value: 'mp3' },
+  { content: 'WAV', value: 'wav' },
+  { content: 'M4A', value: 'm4a' },
+  { content: 'FLAC', value: 'flac' },
+  { content: 'OGG', value: 'ogg' },
 ]);
 type TagInputInstance = ComponentPublicInstance<{ focus: () => void; select: () => void }>;
 const tagDropdownOptions = computed(() =>
@@ -554,6 +560,7 @@ const loadKnowledgeBaseInfo = async (targetKbId: string) => {
     // 重置store中的标签选择状态，避免上传文档时自动带上之前选择的标签
     uiStore.setSelectedTagId('');
     if (!isFAQ.value) {
+      docListLoading.value = true;
       loadKnowledgeFiles(targetKbId);
     } else {
       cardList.value = [];
@@ -708,9 +715,14 @@ onUnmounted(() => {
   window.removeEventListener('knowledgeFileUploaded', handleFileUploaded as EventListener);
   window.removeEventListener('openURLImportDialog', handleOpenURLImportDialog as EventListener);
   stopMovePoll();
+  if (timeout !== null) {
+    clearTimeout(timeout);
+    timeout = null;
+  }
 });
 watch(() => cardList.value, (newValue) => {
   if (isFAQ.value) return;
+  docListLoading.value = false;
 
   // Auto-open document if navigated with ?knowledge_id=xxx
   if (pendingKnowledgeId.value && newValue?.length) {
@@ -726,7 +738,7 @@ watch(() => cardList.value, (newValue) => {
     return isParsing || isSummaryPending;
   })
   if (timeout !== null) {
-    clearInterval(timeout);
+    clearTimeout(timeout);
     timeout = null;
   }
   if (analyzeList.length) {
@@ -753,25 +765,59 @@ type KnowledgeCard = {
   tag_id?: string;
 };
 const updateStatus = (analyzeList: KnowledgeCard[]) => {
+  if (timeout !== null) {
+    clearTimeout(timeout);
+    timeout = null;
+  }
+  if (!analyzeList.length) return;
+
   let query = ``;
   for (let i = 0; i < analyzeList.length; i++) {
     query += `ids=${analyzeList[i].id}&`;
   }
-  timeout = setInterval(() => {
+  timeout = setTimeout(() => {
     batchQueryKnowledge(query).then((result: any) => {
+      let hasChanges = false;
       if (result.success && result.data) {
         (result.data as KnowledgeCard[]).forEach((item: KnowledgeCard) => {
           const index = cardList.value.findIndex(card => card.id == item.id);
           if (index == -1) return;
           
-          // Always update the card data
-          cardList.value[index].parse_status = item.parse_status;
-          cardList.value[index].summary_status = item.summary_status;
-          cardList.value[index].description = item.description;
+          if (cardList.value[index].parse_status !== item.parse_status ||
+              cardList.value[index].summary_status !== item.summary_status ||
+              cardList.value[index].description !== item.description) {
+            
+            // Always update the card data
+            cardList.value[index].parse_status = item.parse_status;
+            cardList.value[index].summary_status = item.summary_status;
+            cardList.value[index].description = item.description;
+            hasChanges = true;
+          }
         });
+      }
+      // If there are no changes, the watch won't trigger, so we must manually poll again
+      // Even if there are changes, we can manually poll again just to be safe.
+      // The watch will clear this timeout if it triggers.
+      const stillPending = cardList.value.filter(item => {
+        const isParsing = item.parse_status == 'pending' || item.parse_status == 'processing';
+        const isSummaryPending = item.parse_status == 'completed' && 
+          (item.summary_status == 'pending' || item.summary_status == 'processing');
+        return isParsing || isSummaryPending;
+      });
+      if (stillPending.length > 0) {
+        updateStatus(stillPending);
       }
     }).catch((_err) => {
       // 错误处理
+      const stillPending = cardList.value.filter(item => {
+        const isParsing = item.parse_status == 'pending' || item.parse_status == 'processing';
+        const isSummaryPending = item.parse_status == 'completed' && 
+          (item.summary_status == 'pending' || item.summary_status == 'processing');
+        return isParsing || isSummaryPending;
+      });
+      if (stillPending.length > 0) {
+        updateStatus(stillPending);
+      }
     });
   }, 1500);
 };
@@ -1015,16 +1061,54 @@ const handleDocumentUpload = async (event: Event) => {
     return;
   }
 
+  const vlmEnabled = kbInfo.value?.vlm_config?.enabled || false;
+  const asrEnabled = kbInfo.value?.asr_config?.enabled || false;
   const dynamicTypes = supportedFileTypes.value.size > 0 ? supportedFileTypes.value : undefined
   const validFiles: File[] = [];
   let skippedCount = 0;
+  let imageFilteredCount = 0;
+  let videoFilteredCount = 0;
+  let audioFilteredCount = 0;
+
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
+    const fileExt = file.name.substring(file.name.lastIndexOf('.') + 1).toLowerCase();
+    const imageTypes = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'];
+    const videoTypes = ['mp4', 'mov', 'avi', 'mkv', 'webm', 'wmv', 'flv'];
+    const audioTypes = ['mp3', 'wav', 'm4a', 'flac', 'ogg'];
+
+    if (videoTypes.includes(fileExt)) {
+      videoFilteredCount++;
+      continue;
+    }
+
+    if (!vlmEnabled) {
+      if (imageTypes.includes(fileExt)) {
+        imageFilteredCount++;
+        continue;
+      }
+    }
+
+    if (!asrEnabled && audioTypes.includes(fileExt)) {
+      audioFilteredCount++;
+      continue;
+    }
+
     if (!kbFileTypeVerification(file, files.length > 1, dynamicTypes)) {
       validFiles.push(file);
     } else {
       skippedCount++;
     }
+  }
+
+  if (imageFilteredCount > 0) {
+    MessagePlugin.warning(t('knowledgeBase.imagesFilteredNoVLM', { count: imageFilteredCount }));
+  }
+  if (videoFilteredCount > 0) {
+    MessagePlugin.warning(t('knowledgeBase.videosFilteredNoVLM', { count: videoFilteredCount }));
+  }
+  if (audioFilteredCount > 0) {
+    MessagePlugin.warning(t('knowledgeBase.audiosFilteredNoASR', { count: audioFilteredCount }));
   }
 
   if (validFiles.length === 0) {
@@ -1115,11 +1199,14 @@ const handleFolderUpload = async (event: Event) => {
   }
 
   const vlmEnabled = kbInfo.value?.vlm_config?.enabled || false;
+  const asrEnabled = kbInfo.value?.asr_config?.enabled || false;
   const dynamicTypes = supportedFileTypes.value.size > 0 ? supportedFileTypes.value : undefined
 
   const validFiles: File[] = [];
   let hiddenFileCount = 0;
   let imageFilteredCount = 0;
+  let videoFilteredCount = 0;
+  let audioFilteredCount = 0;
 
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
@@ -1132,13 +1219,26 @@ const handleFolderUpload = async (event: Event) => {
       continue;
     }
     
+    const fileExt = file.name.substring(file.name.lastIndexOf('.') + 1).toLowerCase();
+    const imageTypes = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'];
+    const videoTypes = ['mp4', 'mov', 'avi', 'mkv', 'webm', 'wmv', 'flv'];
+    const audioTypes = ['mp3', 'wav', 'm4a', 'flac', 'ogg'];
+
+    if (videoTypes.includes(fileExt)) {
+      videoFilteredCount++;
+      continue;
+    }
+
     if (!vlmEnabled) {
-      const fileExt = file.name.substring(file.name.lastIndexOf('.') + 1).toLowerCase();
-      const imageTypes = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'];
       if (imageTypes.includes(fileExt)) {
         imageFilteredCount++;
         continue;
       }
+    }
+
+    if (!asrEnabled && audioTypes.includes(fileExt)) {
+      audioFilteredCount++;
+      continue;
     }
     
     if (!kbFileTypeVerification(file, true, dynamicTypes)) {
@@ -1146,12 +1246,21 @@ const handleFolderUpload = async (event: Event) => {
     }
   }
 
+  if (imageFilteredCount > 0) {
+    MessagePlugin.warning(t('knowledgeBase.imagesFilteredNoVLM', { count: imageFilteredCount }));
+  }
+  if (videoFilteredCount > 0) {
+    MessagePlugin.warning(t('knowledgeBase.videosFilteredNoVLM', { count: videoFilteredCount }));
+  }
+  if (audioFilteredCount > 0) {
+    MessagePlugin.warning(t('knowledgeBase.audiosFilteredNoASR', { count: audioFilteredCount }));
+  }
+
   if (validFiles.length === 0) {
     MessagePlugin.warning(t('knowledgeBase.noValidFilesInFolder', { total: files.length }));
     if (input) input.value = '';
     return;
   }
-
   MessagePlugin.info(t('knowledgeBase.uploadingFolder', { total: validFiles.length }));
 
   // 批量上传
@@ -1444,8 +1553,13 @@ async function createNewSession(value: string): Promise<void> {
                   :disabled="!kbId"
                   @click.stop="handleNavigateToCurrentKB"
                 >
-                  <span>{{ kbInfo?.name || '--' }}</span>
-                  <t-icon name="chevron-down" />
+                  <template v-if="!kbInfo">
+                    <t-skeleton animation="gradient" :row-col="[{ width: '120px', height: '20px' }]" />
+                  </template>
+                  <template v-else>
+                    <span>{{ kbInfo.name }}</span>
+                    <t-icon name="chevron-down" />
+                  </template>
                 </button>
               </t-dropdown>
               <button
@@ -1455,13 +1569,18 @@ async function createNewSession(value: string): Promise<void> {
                 :disabled="!kbId"
                 @click="handleNavigateToCurrentKB"
               >
-                {{ kbInfo?.name || '--' }}
+                <template v-if="!kbInfo">
+                  <t-skeleton animation="gradient" :row-col="[{ width: '120px', height: '20px' }]" />
+                </template>
+                <template v-else>
+                  {{ kbInfo.name }}
+                </template>
               </button>
               <t-icon name="chevron-right" class="breadcrumb-separator" />
               <span class="breadcrumb-current">{{ $t('knowledgeEditor.document.title') }}</span>
             </h2>
             <!-- 身份与最后更新：紧凑单行，置于标题行右侧，悬停显示权限说明 -->
-            <div v-if="kbInfo" class="kb-access-meta">
+            <div v-if="kbInfo && !authStore.isLiteMode" class="kb-access-meta">
               <t-tooltip :content="accessPermissionSummary" placement="top">
                 <span class="kb-access-meta-inner">
                   <t-tag size="small" :theme="isOwner ? 'success' : (effectiveKBPermission === 'admin' ? 'primary' : effectiveKBPermission === 'editor' ? 'warning' : 'default')" class="kb-access-role-tag">
@@ -1514,7 +1633,7 @@ async function createNewSession(value: string): Promise<void> {
         ref="uploadInputRef"
         type="file"
         class="document-upload-input"
-        :accept="acceptFileTypes || '.pdf,.docx,.doc,.txt,.md,.json,.jpg,.jpeg,.png,.csv,.xlsx,.xls,.pptx,.ppt,.mp3,.wav,.m4a,.flac,.ogg'"
+          :accept="acceptFileTypes || '.pdf,.docx,.doc,.txt,.md,.json,.jpg,.jpeg,.png,.csv,.xlsx,.xls,.pptx,.ppt,.mp3,.wav,.m4a,.flac,.ogg'"
         multiple
         @change="handleDocumentUpload"
       />
@@ -1541,7 +1660,7 @@ async function createNewSession(value: string): Promise<void> {
                 :title="$t('knowledgeBase.tagCreateAction')"
                 @click="startCreateTag"
               >
-                <span class="create-tag-plus" aria-hidden="true">+</span>
+                <t-icon name="add" />
               </t-button>
             </div>
           </div>
@@ -1557,11 +1676,18 @@ async function createNewSession(value: string): Promise<void> {
               </template>
             </t-input>
           </div>
-          <t-loading :loading="tagLoading" size="small">
-            <div class="tag-list">
+          <div class="tag-list">
+            <template v-if="tagLoading && !filteredTags.length">
+              <div v-for="n in 8" :key="'skel-tag-'+n" class="tag-list-item" style="cursor: default; pointer-events: none;">
+                <div class="tag-list-left" style="gap: 12px; width: 100%;">
+                  <t-skeleton animation="gradient" :row-col="[{ width: '80%', height: '18px' }]" />
+                </div>
+              </div>
+            </template>
+            <template v-else>
               <div v-if="creatingTag" class="tag-list-item tag-editing" @click.stop>
                 <div class="tag-list-left">
-                  <t-icon name="folder" size="18px" />
+                  <span class="tag-hash-icon">#</span>
                   <div class="tag-edit-input">
                     <t-input
                       ref="newTagInputRef"
@@ -1606,7 +1732,7 @@ async function createNewSession(value: string): Promise<void> {
                   @click="handleTagRowClick(tag.id)"
                 >
                   <div class="tag-list-left">
-                    <t-icon name="folder" size="18px" />
+                    <span class="tag-hash-icon">#</span>
                     <template v-if="editingTagId === tag.id">
                       <div class="tag-edit-input" @click.stop>
                         <t-input
@@ -1685,8 +1811,8 @@ async function createNewSession(value: string): Promise<void> {
                   {{ $t('tenant.loadMore') }}
                 </t-button>
               </div>
-            </div>
-          </t-loading>
+            </template>
+          </div>
         </aside>
         <div class="tag-content">
           <div class="doc-card-area">
@@ -1732,8 +1858,22 @@ async function createNewSession(value: string): Promise<void> {
               ref="knowledgeScroll"
               @scroll="handleScroll"
             >
-              <template v-if="cardList.length">
-                <div class="doc-card-list">
+              <!-- 文档骨架屏 -->
+              <div v-if="docListLoading && cardList.length === 0" class="doc-card-list doc-card-list-animated">
+                <div v-for="n in 8" :key="'doc-skel-'+n" class="knowledge-card knowledge-card-skeleton">
+                  <div class="card-content">
+                    <div class="card-content-nav">
+                      <t-skeleton animation="gradient" :row-col="[{ width: '70%', height: '18px' }]" />
+                    </div>
+                    <t-skeleton animation="gradient" :row-col="[{ width: '100%', height: '14px' }, { width: '60%', height: '14px' }]" />
+                  </div>
+                  <div class="card-bottom">
+                    <t-skeleton animation="gradient" :row-col="[[{ width: '80px', height: '14px' }, { width: '40px', height: '18px', type: 'rect' }]]" />
+                  </div>
+                </div>
+              </div>
+              <template v-else-if="cardList.length">
+                <div class="doc-card-list doc-card-list-animated">
                   <!-- 现有文档卡片 -->
                   <div
                     class="knowledge-card"
@@ -1952,7 +2092,7 @@ async function createNewSession(value: string): Promise<void> {
                   </div>
                 </Teleport>
               </template>
-              <template v-else>
+              <template v-else-if="!docListLoading">
                 <div class="doc-empty-state">
                   <EmptyKnowledge />
                 </div>
@@ -2078,19 +2218,18 @@ async function createNewSession(value: string): Promise<void> {
   display: flex;
   flex: 1;
   min-height: 0;
-  background: var(--td-bg-color-container);
-  border: 1px solid var(--td-component-stroke);
-  border-radius: 10px;
-  overflow: hidden;
+  background: transparent;
+  border: none;
 }
 
-// 与列表页筛选区一致：白底卡片感、细分界
+// 贴近整体系统设计语言的极简侧栏（对齐 menu 与右侧主窗口质感）
 .tag-sidebar {
-  width: 200px;
-  background: var(--td-bg-color-container);
+  width: 180px;
+  background: transparent;
+  border: none;
   border-right: 1px solid var(--td-component-stroke);
-  box-shadow: 2px 0 8px rgba(0, 0, 0, 0.04);
-  padding: 16px;
+  box-shadow: 1px 0 0 rgba(0, 0, 0, 0.02);
+  padding: 0 16px 0 0;
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
@@ -2101,62 +2240,71 @@ async function createNewSession(value: string): Promise<void> {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 10px;
+    margin-bottom: 12px;
+    padding: 0 4px;
     color: var(--td-text-color-primary);
 
     .sidebar-title {
       display: flex;
       align-items: baseline;
-      gap: 4px;
-      font-size: 13px;
+      gap: 6px;
+      font-size: 14px;
       font-weight: 600;
+      letter-spacing: 0.5px;
 
       .sidebar-count {
         font-size: 12px;
-        color: var(--td-text-color-secondary);
+        color: var(--td-text-color-placeholder);
+        font-weight: 400;
       }
     }
 
     .sidebar-actions {
       display: flex;
       gap: 6px;
-      color: var(--td-text-color-placeholder);
       align-items: center;
 
       .create-tag-btn {
         width: 24px;
         height: 24px;
         padding: 0;
-        border-radius: 6px;
+        border-radius: 4px;
         display: flex;
         align-items: center;
         justify-content: center;
-        font-size: 16px;
-        font-weight: 600;
-        color: var(--td-success-color);
-        line-height: 1;
-        transition: background 0.2s ease, color 0.2s ease;
+        color: var(--td-text-color-secondary);
+        transition: all 0.2s ease;
+
+        .t-icon {
+          font-size: 16px;
+        }
 
         &:hover {
           background: var(--td-bg-color-secondarycontainer);
-          color: var(--td-brand-color-active);
+          color: var(--td-brand-color);
         }
-      }
-
-      .create-tag-plus {
-        line-height: 1;
       }
     }
   }
 
   .tag-search-bar {
-    margin-bottom: 10px;
+    margin-bottom: 12px;
+    padding: 0 4px;
 
     :deep(.t-input) {
       font-size: 13px;
-      background-color: var(--td-bg-color-container);
-      border-color: var(--td-component-stroke);
+      background-color: var(--td-bg-color-secondarycontainer);
+      border-color: transparent;
       border-radius: 6px;
+      box-shadow: none !important;
+
+      &:hover,
+      &:focus,
+      &.t-is-focused {
+        border-color: var(--td-brand-color);
+        background-color: var(--td-bg-color-container);
+        box-shadow: none !important;
+      }
     }
   }
 
@@ -2190,13 +2338,13 @@ async function createNewSession(value: string): Promise<void> {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 9px 12px;
+      padding: 8px 8px;
       border-radius: 6px;
       color: var(--td-text-color-primary);
       cursor: pointer;
       transition: all 0.2s ease;
       font-family: "PingFang SC", -apple-system, BlinkMacSystemFont, sans-serif;
-      font-size: 14px;
+      font-size: 13px;
       -webkit-font-smoothing: antialiased;
 
       .tag-list-left {
@@ -2206,11 +2354,24 @@ async function createNewSession(value: string): Promise<void> {
         min-width: 0;
         flex: 1;
 
-        .t-icon {
+        .t-icon,
+        .tag-hash-icon {
           flex-shrink: 0;
           color: var(--td-text-color-secondary);
-          font-size: 14px;
           transition: color 0.2s ease;
+        }
+
+        .t-icon {
+          font-size: 16px;
+        }
+
+        .tag-hash-icon {
+          font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+          font-size: 16px;
+          font-weight: 500;
+          width: 16px;
+          text-align: center;
+          display: inline-block;
         }
       }
 
@@ -2221,10 +2382,9 @@ async function createNewSession(value: string): Promise<void> {
         text-overflow: ellipsis;
         white-space: nowrap;
         font-family: "PingFang SC", -apple-system, BlinkMacSystemFont, sans-serif;
-        font-size: 14px;
-        font-weight: 450;
+        font-size: 13px;
+        font-weight: 400;
         line-height: 1.4;
-        letter-spacing: 0.01em;
       }
 
       .tag-list-right {
@@ -2237,37 +2397,34 @@ async function createNewSession(value: string): Promise<void> {
 
       .tag-count {
         font-size: 12px;
-        color: var(--td-text-color-secondary);
-        font-weight: 500;
-        min-width: 28px;
-        padding: 3px 7px;
-        border-radius: 8px;
-        background: var(--td-bg-color-secondarycontainer);
+        color: var(--td-text-color-placeholder);
+        font-weight: 400;
         transition: all 0.2s ease;
-        text-align: center;
-        box-sizing: border-box;
+        text-align: right;
+        padding-left: 8px;
+        background: transparent;
       }
 
       &:hover {
         background: var(--td-bg-color-secondarycontainer);
         color: var(--td-text-color-primary);
 
-        .tag-list-left .t-icon {
-          color: var(--td-text-color-primary);
+        .tag-list-left .t-icon,
+        .tag-list-left .tag-hash-icon {
+          color: var(--td-text-color-secondary);
         }
 
         .tag-count {
-          background: var(--td-bg-color-secondarycontainer);
-          color: var(--td-text-color-primary);
+          color: var(--td-text-color-secondary);
         }
       }
 
       &.active {
-        background: var(--td-success-color-light);
+        background: var(--td-brand-color-light);
         color: var(--td-brand-color);
-        font-weight: 500;
 
-        .tag-list-left .t-icon {
+        .tag-list-left .t-icon,
+        .tag-list-left .tag-hash-icon {
           color: var(--td-brand-color);
         }
 
@@ -2276,9 +2433,7 @@ async function createNewSession(value: string): Promise<void> {
         }
 
         .tag-count {
-          background: var(--td-success-color-light);
           color: var(--td-brand-color);
-          font-weight: 600;
         }
       }
 
@@ -2322,22 +2477,22 @@ async function createNewSession(value: string): Promise<void> {
         }
 
         :deep(.tag-action-btn.confirm) {
-          background: var(--td-success-color-light);
-          color: var(--td-brand-color-active);
-
-          &:hover {
-            background: var(--td-success-color-light);
-            color: var(--td-success-color);
-          }
-        }
-
-        :deep(.tag-action-btn.cancel) {
-          background: var(--td-bg-color-secondarycontainer);
+          background: transparent;
           color: var(--td-text-color-secondary);
 
           &:hover {
             background: var(--td-bg-color-secondarycontainer);
-            color: var(--td-text-color-secondary);
+            color: var(--td-brand-color);
+          }
+        }
+
+        :deep(.tag-action-btn.cancel) {
+          background: transparent;
+          color: var(--td-text-color-secondary);
+
+          &:hover {
+            background: var(--td-bg-color-secondarycontainer);
+            color: var(--td-error-color);
           }
         }
       }
@@ -2348,48 +2503,38 @@ async function createNewSession(value: string): Promise<void> {
         max-width: 100%;
 
         :deep(.t-input) {
-          font-size: 12px;
+          font-size: 13px;
           background-color: transparent;
           border: none;
-          border-bottom: 1px solid var(--td-component-stroke);
           border-radius: 0;
           box-shadow: none;
-          padding-left: 0;
-          padding-right: 0;
+          padding: 0;
         }
 
         :deep(.t-input__wrap) {
           background-color: transparent;
           border: none;
-          border-bottom: 1px solid var(--td-component-stroke);
           border-radius: 0;
           box-shadow: none;
         }
 
         :deep(.t-input__inner) {
-          padding-left: 0;
-          padding-right: 0;
+          padding: 0;
           color: var(--td-text-color-primary);
-          caret-color: var(--td-text-color-primary);
+          caret-color: var(--td-brand-color);
         }
 
         :deep(.t-input:hover),
         :deep(.t-input.t-is-focused),
         :deep(.t-input__wrap:hover),
         :deep(.t-input__wrap.t-is-focused) {
-          border-bottom-color: var(--td-success-color);
+          border-color: transparent;
         }
       }
 
       .tag-more {
         display: flex;
         align-items: center;
-        opacity: 0;
-        transition: opacity 0.2s ease;
-      }
-
-      &:hover .tag-more {
-        opacity: 1;
       }
 
       .tag-more-btn {
@@ -2399,7 +2544,7 @@ async function createNewSession(value: string): Promise<void> {
         align-items: center;
         justify-content: center;
         border-radius: 4px;
-        color: var(--td-text-color-secondary);
+        color: var(--td-text-color-placeholder);
         transition: all 0.2s ease;
 
         &:hover {
@@ -2413,7 +2558,7 @@ async function createNewSession(value: string): Promise<void> {
       text-align: center;
       padding: 10px 6px;
       color: var(--td-text-color-placeholder);
-      font-size: 11px;
+      font-size: 12px;
     }
   }
 }
@@ -2464,9 +2609,10 @@ async function createNewSession(value: string): Promise<void> {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  padding: 12px;
+  padding: 0 0 0 16px;
+  border: none;
   overflow: hidden;
-  background: var(--td-bg-color-container);
+  background: transparent;
 }
 
 .doc-card-area {
@@ -2508,29 +2654,33 @@ async function createNewSession(value: string): Promise<void> {
 
   :deep(.t-input) {
     font-size: 13px;
-    background-color: var(--td-bg-color-container);
-    border-color: var(--td-component-stroke);
+    background-color: var(--td-bg-color-secondarycontainer);
+    border-color: transparent;
     border-radius: 6px;
+    box-shadow: none !important;
 
     &:hover,
     &:focus,
     &.t-is-focused {
       border-color: var(--td-brand-color);
       background-color: var(--td-bg-color-container);
+      box-shadow: none !important;
     }
   }
 
   :deep(.t-select) {
     .t-input {
       font-size: 13px;
-      background-color: var(--td-bg-color-container);
-      border-color: var(--td-component-stroke);
+      background-color: var(--td-bg-color-secondarycontainer);
+      border-color: transparent;
       border-radius: 6px;
+      box-shadow: none !important;
 
       &:hover,
       &.t-is-focused {
         border-color: var(--td-brand-color);
         background-color: var(--td-bg-color-container);
+        box-shadow: none !important;
       }
     }
   }
@@ -2872,6 +3022,11 @@ async function createNewSession(value: string): Promise<void> {
   }
 }
 
+@keyframes contentFadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
 .doc-card-list {
   box-sizing: border-box;
   display: grid;
@@ -2879,6 +3034,29 @@ async function createNewSession(value: string): Promise<void> {
   gap: 14px;
   align-content: flex-start;
   width: 100%;
+
+  &.doc-card-list-animated {
+    animation: contentFadeIn 0.32s ease-out;
+  }
+}
+
+.knowledge-card-skeleton {
+  cursor: default;
+  .card-content { padding: 15px 17px 13px; }
+  .card-content-nav { margin-bottom: 14px; }
+  .card-bottom {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    padding: 0 17px;
+    box-sizing: border-box;
+    height: 34px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-top: 1px solid var(--td-component-stroke);
+  }
 }
 
 .doc-empty-state {

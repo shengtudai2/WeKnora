@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"os"
 	"path"
-	"regexp"
 	"runtime"
 	"slices"
 	"sort"
@@ -30,6 +29,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/models/embedding"
+	"github.com/Tencent/WeKnora/internal/searchutil"
 	"github.com/Tencent/WeKnora/internal/tracing"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -65,6 +65,7 @@ type knowledgeService struct {
 	repo           interfaces.KnowledgeRepository
 	kbService      interfaces.KnowledgeBaseService
 	tenantRepo     interfaces.TenantRepository
+	tenantService  interfaces.TenantService
 	documentReader interfaces.DocumentReader
 	chunkService   interfaces.ChunkService
 	chunkRepo      interfaces.ChunkRepository
@@ -77,6 +78,10 @@ type knowledgeService struct {
 	redisClient    *redis.Client
 	kbShareService interfaces.KBShareService
 	imageResolver  *docparser.ImageResolver
+
+	// In-memory fallbacks for Lite mode (no Redis)
+	memFAQProgress      sync.Map // taskID -> *types.FAQImportProgress
+	memFAQRunningImport sync.Map // kbID -> *runningFAQImportInfo
 }
 
 const (
@@ -92,6 +97,7 @@ func NewKnowledgeService(
 	documentReader interfaces.DocumentReader,
 	kbService interfaces.KnowledgeBaseService,
 	tenantRepo interfaces.TenantRepository,
+	tenantService interfaces.TenantService,
 	chunkService interfaces.ChunkService,
 	chunkRepo interfaces.ChunkRepository,
 	tagRepo interfaces.KnowledgeTagRepository,
@@ -110,6 +116,7 @@ func NewKnowledgeService(
 		repo:           repo,
 		kbService:      kbService,
 		tenantRepo:     tenantRepo,
+		tenantService:  tenantService,
 		documentReader: documentReader,
 		chunkService:   chunkService,
 		chunkRepo:      chunkRepo,
@@ -200,12 +207,22 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 
 	logger.Infof(ctx, "Knowledge base ID: %s, file: %s", kbID, fileName)
 
+	if IsVideoType(getFileType(fileName)) {
+		logger.Error(ctx, "Video file upload is not supported")
+		return nil, werrors.NewBadRequestError("暂不支持上传视频文件")
+	}
+
 	// Get knowledge base configuration
 	logger.Info(ctx, "Getting knowledge base configuration")
 	kb, err := s.kbService.GetKnowledgeBaseByID(ctx, kbID)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to get knowledge base: %v", err)
 		return nil, err
+	}
+
+	// FAQ knowledge bases should not accept file uploads — use the FAQ import API instead
+	if kb.Type == types.KnowledgeBaseTypeFAQ {
+		return nil, werrors.NewBadRequestError("FAQ 知识库不支持文件上传，请使用 FAQ 导入功能")
 	}
 
 	if err := checkStorageEngineConfigured(ctx, kb); err != nil {
@@ -1483,6 +1500,26 @@ type ProcessChunksOptions struct {
 	// When set, the chunks passed to processChunks are child chunks, and each
 	// child's ParentIndex references an entry in this slice.
 	ParentChunks []types.ParsedParentChunk
+	Metadata     map[string]string
+}
+
+// buildSplitterConfig creates a SplitterConfig with fallbacks from a KnowledgeBase.
+func buildSplitterConfig(kb *types.KnowledgeBase) chunker.SplitterConfig {
+	chunkCfg := chunker.SplitterConfig{
+		ChunkSize:    kb.ChunkingConfig.ChunkSize,
+		ChunkOverlap: kb.ChunkingConfig.ChunkOverlap,
+		Separators:   kb.ChunkingConfig.Separators,
+	}
+	if chunkCfg.ChunkSize <= 0 {
+		chunkCfg.ChunkSize = 512
+	}
+	if chunkCfg.ChunkOverlap <= 0 {
+		chunkCfg.ChunkOverlap = 50
+	}
+	if len(chunkCfg.Separators) == 0 {
+		chunkCfg.Separators = []string{"\n\n", "\n", "。"}
+	}
+	return chunkCfg
 }
 
 // buildParentChildConfigs derives parent and child SplitterConfig from ChunkingConfig.
@@ -1839,17 +1876,6 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	}
 	logger.GetLogger(ctx).Infof("processChunks batch index successfully, with %d index", len(indexInfoList))
 
-	logger.Infof(ctx, "processChunks create relationship rag task")
-	if kb.ExtractConfig != nil && kb.ExtractConfig.Enabled {
-		for _, chunk := range textChunks {
-			err := NewChunkExtractTask(ctx, s.task, chunk.TenantID, chunk.ID, kb.SummaryModelID)
-			if err != nil {
-				logger.GetLogger(ctx).WithField("error", err).Errorf("processChunks create chunk extract task failed")
-				span.RecordError(err)
-			}
-		}
-	}
-
 	// Final check before marking as completed - if deleted during processing, don't update status
 	if s.isKnowledgeDeleting(ctx, knowledge.TenantID, knowledge.ID) {
 		logger.Infof(ctx, "Knowledge was deleted during processing, skipping completion update: %s", knowledge.ID)
@@ -1864,18 +1890,15 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 		return
 	}
 
-	// Skip summary/question generation for image-type knowledge — the text chunk
-	// is just a markdown image reference, so LLM summary would be useless.
-	// The multimodal task will provide a caption as the description instead.
+	// Check if this document has extracted images that will be processed asynchronously
 	isImage := IsImageType(knowledge.FileType)
+	isVideo := IsVideoType(knowledge.FileType)
 	pendingMultimodal := isImage && options.EnableMultimodel && len(options.StoredImages) > 0
+	pendingPDFMultimodal := !isImage && !isVideo && options.EnableMultimodel && len(options.StoredImages) > 0
 
-	// For image files with pending multimodal processing, keep "processing" status
-	// so the frontend waits until the description is ready before showing "completed".
-	if pendingMultimodal {
+	// For image files or documents with pending multimodal processing, keep "processing" status
+	if pendingMultimodal || pendingPDFMultimodal {
 		knowledge.ParseStatus = types.ParseStatusProcessing
-	} else {
-		knowledge.ParseStatus = types.ParseStatusCompleted
 	}
 	knowledge.EnableStatus = "enabled"
 	knowledge.StorageSize = totalStorageSize
@@ -1883,37 +1906,32 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	knowledge.ProcessedAt = &now
 	knowledge.UpdatedAt = now
 
-	// Set summary status based on whether summary generation will be triggered
-	if len(textChunks) > 0 && !isImage {
-		knowledge.SummaryStatus = types.SummaryStatusPending
-	} else {
-		knowledge.SummaryStatus = types.SummaryStatusNone
-	}
-
 	if err := s.repo.UpdateKnowledge(ctx, knowledge); err != nil {
 		logger.GetLogger(ctx).WithField("error", err).Errorf("processChunks update knowledge failed")
 	}
 
-	// Enqueue question generation task if enabled (async, non-blocking)
-	if options.EnableQuestionGeneration && len(textChunks) > 0 && !isImage {
-		questionCount := options.QuestionCount
-		if questionCount <= 0 {
-			questionCount = 3
-		}
-		if questionCount > 10 {
-			questionCount = 10
-		}
-		s.enqueueQuestionGenerationTask(ctx, knowledge.KnowledgeBaseID, knowledge.ID, questionCount)
-	}
-
-	// Enqueue summary generation task (async, non-blocking)
-	if len(textChunks) > 0 && !isImage {
-		s.enqueueSummaryGenerationTask(ctx, knowledge.KnowledgeBaseID, knowledge.ID)
-	}
-
 	// Enqueue multimodal tasks for images (async, non-blocking)
 	if options.EnableMultimodel && len(options.StoredImages) > 0 {
-		s.enqueueImageMultimodalTasks(ctx, knowledge, kb, options.StoredImages, chunks)
+		s.enqueueImageMultimodalTasks(ctx, knowledge, kb, options.StoredImages, chunks, options.Metadata)
+	} else {
+		// If there are no multimodal tasks, enqueue the post process task immediately
+		lang, _ := types.LanguageFromContext(ctx)
+		payloadBytes, err := json.Marshal(types.KnowledgePostProcessPayload{
+			TenantID:        knowledge.TenantID,
+			KnowledgeID:     knowledge.ID,
+			KnowledgeBaseID: knowledge.KnowledgeBaseID,
+			Language:        lang,
+		})
+		if err == nil {
+			task := asynq.NewTask(types.TypeKnowledgePostProcess, payloadBytes, asynq.Queue("default"), asynq.MaxRetry(3))
+			if _, err := s.task.Enqueue(task); err != nil {
+				logger.Errorf(ctx, "Failed to enqueue knowledge post process task: %v", err)
+			} else {
+				logger.Infof(ctx, "Enqueued knowledge post process task for %s", knowledge.ID)
+			}
+		} else {
+			logger.Errorf(ctx, "Failed to marshal knowledge post process payload: %v", err)
+		}
 	}
 
 	// Update tenant's storage usage
@@ -1925,7 +1943,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 }
 
 // defaultMaxInputChars is the default maximum characters used as input for summary generation.
-const defaultMaxInputChars = 16384
+const defaultMaxInputChars = 1024 * 24
 
 // getSummary generates a summary for knowledge content using an AI model
 func (s *knowledgeService) getSummary(ctx context.Context,
@@ -1942,52 +1960,36 @@ func (s *knowledgeService) getSummary(ctx context.Context,
 		maxInputChars = s.config.Conversation.Summary.MaxInputChars
 	}
 
-	// concat chunk contents
-	chunkContents := ""
-	allImageInfos := make([]*types.ImageInfo, 0)
-
-	// then, sort chunks by StartAt
+	// Sort chunks by StartAt for proper concatenation
 	sortedChunks := make([]*types.Chunk, len(chunks))
 	copy(sortedChunks, chunks)
 	sort.Slice(sortedChunks, func(i, j int) bool {
 		return sortedChunks[i].StartAt < sortedChunks[j].StartAt
 	})
 
-	// concat ALL chunk contents (no early truncation) and collect image infos
+	// Concatenate original chunk contents by StartAt offset to reconstruct the
+	// document, then enrich with image info in a second pass. Enrichment must
+	// happen AFTER concatenation because StartAt is based on original document
+	// offsets — enriched (longer) content would break the positioning.
+	chunkContents := ""
 	for _, chunk := range sortedChunks {
-		// Ensure we don't slice beyond the current content length
 		runes := []rune(chunkContents)
 		if chunk.StartAt <= len(runes) {
 			chunkContents = string(runes[:chunk.StartAt]) + chunk.Content
 		} else {
-			// If StartAt is beyond current content, just append
 			chunkContents = chunkContents + chunk.Content
 		}
-		if chunk.ImageInfo != "" {
-			var images []*types.ImageInfo
-			if err := json.Unmarshal([]byte(chunk.ImageInfo), &images); err == nil {
-				allImageInfos = append(allImageInfos, images...)
-			}
-		}
 	}
-	// remove markdown image syntax
-	re := regexp.MustCompile(`!\[[^\]]*\]\([^)]+\)`)
-	chunkContents = re.ReplaceAllString(chunkContents, "")
-	// collect all image infos
-	if len(allImageInfos) > 0 {
-		// add image infos to chunk contents
-		var imageAnnotations string
-		for _, img := range allImageInfos {
-			if img.Caption != "" {
-				imageAnnotations += fmt.Sprintf("\n[Image Description: %s]", img.Caption)
-			}
-			if img.OCRText != "" {
-				imageAnnotations += fmt.Sprintf("\n[Image OCR Text: %s]", img.OCRText)
-			}
-		}
 
-		// concat chunk contents and image annotations
-		chunkContents = chunkContents + imageAnnotations
+	// Collect image_info from image_ocr/image_caption children and enrich
+	chunkIDs := make([]string, len(sortedChunks))
+	for i, c := range sortedChunks {
+		chunkIDs[i] = c.ID
+	}
+	imageInfoMap := searchutil.CollectImageInfoByChunkIDs(ctx, s.chunkRepo, knowledge.TenantID, chunkIDs)
+	mergedImageInfo := searchutil.MergeImageInfoJSON(imageInfoMap)
+	if mergedImageInfo != "" {
+		chunkContents = searchutil.EnrichContentCaptionOnly(chunkContents, mergedImageInfo)
 	}
 
 	// Apply length limit: sample long content to fit within maxInputChars
@@ -2088,63 +2090,6 @@ func sampleLongContent(content string, maxChars int) string {
 	middle := string(runes[midStart:midEnd])
 
 	return head + omitMarker + middle + omitMarker + tail
-}
-
-// enqueueQuestionGenerationTask enqueues an async task for question generation
-func (s *knowledgeService) enqueueQuestionGenerationTask(ctx context.Context,
-	kbID, knowledgeID string, questionCount int,
-) {
-	tenantID := ctx.Value(types.TenantIDContextKey).(uint64)
-	lang, _ := types.LanguageFromContext(ctx)
-	payload := types.QuestionGenerationPayload{
-		TenantID:        tenantID,
-		KnowledgeBaseID: kbID,
-		KnowledgeID:     knowledgeID,
-		QuestionCount:   questionCount,
-		Language:        lang,
-	}
-
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		logger.Errorf(ctx, "Failed to marshal question generation payload: %v", err)
-		return
-	}
-
-	task := asynq.NewTask(types.TypeQuestionGeneration, payloadBytes, asynq.Queue("low"), asynq.MaxRetry(3))
-	info, err := s.task.Enqueue(task)
-	if err != nil {
-		logger.Errorf(ctx, "Failed to enqueue question generation task: %v", err)
-		return
-	}
-	logger.Infof(ctx, "Enqueued question generation task: %s for knowledge: %s", info.ID, knowledgeID)
-}
-
-// enqueueSummaryGenerationTask enqueues an async task for summary generation
-func (s *knowledgeService) enqueueSummaryGenerationTask(ctx context.Context,
-	kbID, knowledgeID string,
-) {
-	tenantID := ctx.Value(types.TenantIDContextKey).(uint64)
-	lang, _ := types.LanguageFromContext(ctx)
-	payload := types.SummaryGenerationPayload{
-		TenantID:        tenantID,
-		KnowledgeBaseID: kbID,
-		KnowledgeID:     knowledgeID,
-		Language:        lang,
-	}
-
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		logger.Errorf(ctx, "Failed to marshal summary generation payload: %v", err)
-		return
-	}
-
-	task := asynq.NewTask(types.TypeSummaryGeneration, payloadBytes, asynq.Queue("low"), asynq.MaxRetry(3))
-	info, err := s.task.Enqueue(task)
-	if err != nil {
-		logger.Errorf(ctx, "Failed to enqueue summary generation task: %v", err)
-		return
-	}
-	logger.Infof(ctx, "Enqueued summary generation task: %s for knowledge: %s", info.ID, knowledgeID)
 }
 
 // ProcessSummaryGeneration handles async summary generation task
@@ -2434,27 +2379,40 @@ func (s *knowledgeService) ProcessQuestionGeneration(ctx context.Context, t *asy
 		questionCount = 10
 	}
 
+	// Collect image info for all text chunks so question generation can
+	// see caption / OCR text instead of bare image links.
+	textChunkIDs := make([]string, len(textChunks))
+	for i, c := range textChunks {
+		textChunkIDs[i] = c.ID
+	}
+	imageInfoMap := searchutil.CollectImageInfoByChunkIDs(ctx, s.chunkRepo, payload.TenantID, textChunkIDs)
+
+	enrichContent := func(chunk *types.Chunk) string {
+		if info, ok := imageInfoMap[chunk.ID]; ok && info != "" {
+			return searchutil.EnrichContentWithImageInfo(chunk.Content, info)
+		}
+		return chunk.Content
+	}
+
 	// Generate questions for each chunk with context
 	var indexInfoList []*types.IndexInfo
 	for i, chunk := range textChunks {
 		// Build context from adjacent chunks
 		var prevContent, nextContent string
 		if i > 0 {
-			prevContent = textChunks[i-1].Content
-			// Limit context size
+			prevContent = enrichContent(textChunks[i-1])
 			if len(prevContent) > 500 {
 				prevContent = prevContent[len(prevContent)-500:]
 			}
 		}
 		if i < len(textChunks)-1 {
-			nextContent = textChunks[i+1].Content
-			// Limit context size
+			nextContent = enrichContent(textChunks[i+1])
 			if len(nextContent) > 500 {
 				nextContent = nextContent[:500]
 			}
 		}
 
-		questions, err := s.generateQuestionsWithContext(ctx, chatModel, chunk.Content, prevContent, nextContent, knowledge.Title, questionCount)
+		questions, err := s.generateQuestionsWithContext(ctx, chatModel, enrichContent(chunk), prevContent, nextContent, knowledge.Title, questionCount)
 		if err != nil {
 			logger.Warnf(ctx, "Failed to generate questions for chunk %s: %v", chunk.ID, err)
 			continue
@@ -6322,6 +6280,12 @@ type runningFAQImportInfo struct {
 // getRunningFAQImportInfo checks if there's a running FAQ import task for the given KB
 // Returns the task info if found, nil otherwise
 func (s *knowledgeService) getRunningFAQImportInfo(ctx context.Context, kbID string) (*runningFAQImportInfo, error) {
+	if s.redisClient == nil {
+		if v, ok := s.memFAQRunningImport.Load(kbID); ok {
+			return v.(*runningFAQImportInfo), nil
+		}
+		return nil, nil
+	}
 	key := getFAQImportRunningKey(kbID)
 	data, err := s.redisClient.Get(ctx, key).Result()
 	if err != nil {
@@ -6355,6 +6319,10 @@ func (s *knowledgeService) getRunningFAQImportTaskID(ctx context.Context, kbID s
 
 // setRunningFAQImportInfo sets the running task info for a KB
 func (s *knowledgeService) setRunningFAQImportInfo(ctx context.Context, kbID string, info *runningFAQImportInfo) error {
+	if s.redisClient == nil {
+		s.memFAQRunningImport.Store(kbID, info)
+		return nil
+	}
 	key := getFAQImportRunningKey(kbID)
 	data, err := json.Marshal(info)
 	if err != nil {
@@ -6365,6 +6333,10 @@ func (s *knowledgeService) setRunningFAQImportInfo(ctx context.Context, kbID str
 
 // clearRunningFAQImportTaskID clears the running task ID for a KB
 func (s *knowledgeService) clearRunningFAQImportTaskID(ctx context.Context, kbID string) error {
+	if s.redisClient == nil {
+		s.memFAQRunningImport.Delete(kbID)
+		return nil
+	}
 	key := getFAQImportRunningKey(kbID)
 	return s.redisClient.Del(ctx, key).Err()
 }
@@ -7076,20 +7048,7 @@ func (s *knowledgeService) triggerManualProcessing(ctx context.Context,
 	}
 
 	// Manual content is markdown - chunk directly with Go chunker
-	chunkCfg := chunker.SplitterConfig{
-		ChunkSize:    kb.ChunkingConfig.ChunkSize,
-		ChunkOverlap: kb.ChunkingConfig.ChunkOverlap,
-		Separators:   kb.ChunkingConfig.Separators,
-	}
-	if chunkCfg.ChunkSize <= 0 {
-		chunkCfg.ChunkSize = 512
-	}
-	if chunkCfg.ChunkOverlap <= 0 {
-		chunkCfg.ChunkOverlap = 50
-	}
-	if len(chunkCfg.Separators) == 0 {
-		chunkCfg.Separators = []string{"\n\n", "\n", "。"}
-	}
+	chunkCfg := buildSplitterConfig(kb)
 
 	var parsed []types.ParsedChunk
 	opts := ProcessChunksOptions{
@@ -7424,6 +7383,16 @@ func IsAudioType(fileType string) bool {
 	}
 }
 
+// IsVideoType checks if a file type is a video format
+func IsVideoType(fileType string) bool {
+	switch strings.ToLower(fileType) {
+	case "mp4", "mov", "avi", "mkv", "webm", "wmv", "flv":
+		return true
+	default:
+		return false
+	}
+}
+
 // downloadFileFromURL downloads a remote file to a temp file and returns its binary content.
 // payloadFileName and payloadFileType are in/out pointers: if they point to an empty string,
 // the function resolves the value from Content-Disposition / URL path and writes it back.
@@ -7677,6 +7646,17 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 		return nil
 	}
 
+	// 视频文件不再支持入库解析
+	if payload.FilePath != "" && IsVideoType(payload.FileType) {
+		logger.GetLogger(ctx).WithField("knowledge_id", knowledge.ID).
+			Errorf("processDocument video not supported")
+		knowledge.ParseStatus = "failed"
+		knowledge.ErrorMessage = "暂不支持视频文件"
+		knowledge.UpdatedAt = time.Now()
+		s.repo.UpdateKnowledge(ctx, knowledge)
+		return nil
+	}
+
 	// New pipeline: convert -> store images -> chunk -> vectorize -> multimodal tasks
 	var convertResult *types.ReadResult
 	var chunks []types.ParsedChunk
@@ -7824,7 +7804,7 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 			return nil
 		}
 
-		transcribedText, err := asrModel.Transcribe(ctx, convertResult.AudioData, knowledge.FileName)
+		transcriptionResult, err := asrModel.Transcribe(ctx, convertResult.AudioData, knowledge.FileName)
 		if err != nil {
 			logger.Errorf(ctx, "[ASR] Transcription failed: %v", err)
 			if isLastRetry {
@@ -7834,6 +7814,11 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 				s.repo.UpdateKnowledge(ctx, knowledge)
 			}
 			return fmt.Errorf("audio transcription failed: %w", err)
+		}
+
+		var transcribedText string
+		if transcriptionResult != nil {
+			transcribedText = transcriptionResult.Text
 		}
 
 		if transcribedText == "" {
@@ -7879,26 +7864,17 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 	}
 
 	// Step 3: Split into chunks using Go chunker
-	chunkCfg := chunker.SplitterConfig{
-		ChunkSize:    kb.ChunkingConfig.ChunkSize,
-		ChunkOverlap: kb.ChunkingConfig.ChunkOverlap,
-		Separators:   kb.ChunkingConfig.Separators,
-	}
-	if chunkCfg.ChunkSize <= 0 {
-		chunkCfg.ChunkSize = 512
-	}
-	if chunkCfg.ChunkOverlap <= 0 {
-		chunkCfg.ChunkOverlap = 50
-	}
-	if len(chunkCfg.Separators) == 0 {
-		chunkCfg.Separators = []string{"\n\n", "\n", "。"}
-	}
+	chunkCfg := buildSplitterConfig(kb)
 
 	processOpts := ProcessChunksOptions{
 		EnableQuestionGeneration: payload.EnableQuestionGeneration,
 		QuestionCount:            payload.QuestionCount,
 		EnableMultimodel:         payload.EnableMultimodel,
 		StoredImages:             storedImages,
+	}
+
+	if convertResult != nil {
+		processOpts.Metadata = convertResult.Metadata
 	}
 
 	if kb.ChunkingConfig.EnableParentChild {
@@ -7972,8 +7948,10 @@ func (s *knowledgeService) convert(
 	logger.Infof(ctx, "[convert] kb=%s fileType=%s isURL=%v engine=%q rules=%+v",
 		kb.ID, fileType, isURL, parserEngine, kb.ChunkingConfig.ParserEngineRules)
 
-	var reader interfaces.DocReader = s.resolveDocReader(parserEngine, fileType, isURL, overrides)
+	var reader interfaces.DocReader = s.resolveDocReader(ctx, parserEngine, fileType, isURL, overrides)
 	if reader == nil {
+		logger.Errorf(ctx, "[convert] no doc reader for kb=%s knowledge=%s fileType=%s engine=%q isURL=%v",
+			kb.ID, knowledge.ID, fileType, parserEngine, isURL)
 		knowledge.ParseStatus = "failed"
 		knowledge.ErrorMessage = "Document parsing service is not configured. Please use text/paragraph import or set DOCREADER_ADDR."
 		knowledge.UpdatedAt = time.Now()
@@ -8009,6 +7987,8 @@ func (s *knowledgeService) convert(
 		return s.failKnowledge(ctx, knowledge, isLastRetry, "document read failed: %v", err)
 	}
 	if result.Error != "" {
+		logger.Errorf(ctx, "[convert] parser returned error kb=%s knowledge=%s file=%q type=%s engine=%q: %s",
+			kb.ID, knowledge.ID, req.FileName, fileType, parserEngine, result.Error)
 		knowledge.ParseStatus = "failed"
 		knowledge.ErrorMessage = result.Error
 		knowledge.UpdatedAt = time.Now()
@@ -8020,10 +8000,22 @@ func (s *knowledgeService) convert(
 
 // resolveDocReader returns the appropriate DocReader for the given engine.
 // Returns nil when the required service is unavailable.
-func (s *knowledgeService) resolveDocReader(engine, fileType string, isURL bool, overrides map[string]string) interfaces.DocReader {
+func (s *knowledgeService) resolveDocReader(ctx context.Context, engine, fileType string, isURL bool, overrides map[string]string) interfaces.DocReader {
 	switch engine {
 	case docparser.SimpleEngineName:
 		return &docparser.SimpleFormatReader{}
+	case docparser.WeKnoraCloudEngineName:
+		creds := s.tenantService.GetWeKnoraCloudCredentials(ctx)
+		if creds == nil {
+			logger.Warnf(ctx, "[resolveDocReader] WeKnoraCloud: no tenant credentials (fileType=%s)", fileType)
+			return nil
+		}
+		reader, err := docparser.NewWeKnoraCloudSignedDocumentReader(creds.AppID, creds.AppSecret)
+		if err != nil {
+			logger.Errorf(ctx, "[resolveDocReader] WeKnoraCloud reader init failed: %v", err)
+			return nil
+		}
+		return reader
 	case "mineru":
 		return docparser.NewMinerUReader(overrides)
 	case "mineru_cloud":
@@ -8065,9 +8057,17 @@ func (s *knowledgeService) enqueueImageMultimodalTasks(
 	kb *types.KnowledgeBase,
 	images []docparser.StoredImage,
 	chunks []types.ParsedChunk,
+	metadata map[string]string,
 ) {
 	if s.task == nil || len(images) == 0 {
 		return
+	}
+
+	redisKey := fmt.Sprintf("multimodal:pending:%s", knowledge.ID)
+	if s.redisClient != nil {
+		if err := s.redisClient.Set(ctx, redisKey, len(images), 24*time.Hour).Err(); err != nil {
+			logger.Warnf(ctx, "Failed to set multimodal pending count for %s: %v", knowledge.ID, err)
+		}
 	}
 
 	for _, img := range images {
@@ -8094,6 +8094,7 @@ func (s *knowledgeService) enqueueImageMultimodalTasks(
 			EnableOCR:       true,
 			EnableCaption:   true,
 			Language:        lang,
+			ImageSourceType: metadata["image_source_type"],
 		}
 
 		payloadBytes, err := json.Marshal(payload)
@@ -8446,6 +8447,11 @@ func getFAQImportRunningKey(kbID string) string {
 
 // saveFAQImportProgress saves the FAQ import progress to Redis
 func (s *knowledgeService) saveFAQImportProgress(ctx context.Context, progress *types.FAQImportProgress) error {
+	if s.redisClient == nil {
+		progress.UpdatedAt = time.Now().Unix()
+		s.memFAQProgress.Store(progress.TaskID, progress)
+		return nil
+	}
 	key := getFAQImportProgressKey(progress.TaskID)
 	progress.UpdatedAt = time.Now().Unix()
 	data, err := json.Marshal(progress)
@@ -8457,6 +8463,12 @@ func (s *knowledgeService) saveFAQImportProgress(ctx context.Context, progress *
 
 // GetFAQImportProgress retrieves the progress of an FAQ import task
 func (s *knowledgeService) GetFAQImportProgress(ctx context.Context, taskID string) (*types.FAQImportProgress, error) {
+	if s.redisClient == nil {
+		if v, ok := s.memFAQProgress.Load(taskID); ok {
+			return v.(*types.FAQImportProgress), nil
+		}
+		return nil, werrors.NewNotFoundError("FAQ import task not found")
+	}
 	key := getFAQImportProgressKey(taskID)
 	data, err := s.redisClient.Get(ctx, key).Bytes()
 	if err != nil {

@@ -10,6 +10,240 @@ import (
 	"gorm.io/gorm"
 )
 
+// ---------------------------------------------------------------------------
+// PR2 additions: env store builder, response DTO, types metadata
+// ---------------------------------------------------------------------------
+
+// mockEnvLookup creates a simple env lookup function from a map.
+func mockEnvLookup(env map[string]string) EnvLookupFunc {
+	return func(key string) string {
+		return env[key]
+	}
+}
+
+func TestIsEnvStoreID(t *testing.T) {
+	tests := []struct {
+		name     string
+		id       string
+		expected bool
+	}{
+		{"env postgres ID", "__env_postgres__", true},
+		{"env elasticsearch ID", "__env_elasticsearch_v8__", true},
+		{"env prefix only", "__env_", true},
+		{"UUID ID", "550e8400-e29b-41d4-a716-446655440000", false},
+		{"empty string", "", false},
+		{"similar but not prefix", "_env_postgres__", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, IsEnvStoreID(tt.id))
+		})
+	}
+}
+
+func TestBuildEnvVectorStores(t *testing.T) {
+	envMap := map[string]string{
+		"ELASTICSEARCH_ADDR":     "http://es:9200",
+		"ELASTICSEARCH_USERNAME": "elastic",
+		"ELASTICSEARCH_PASSWORD": "secret",
+		"ELASTICSEARCH_INDEX":    "my_index",
+		"QDRANT_HOST":            "qdrant-host",
+		"QDRANT_API_KEY":         "qd-key",
+		"MILVUS_ADDRESS":         "milvus:19530",
+		"WEAVIATE_HOST":          "weaviate:8080",
+	}
+	lookup := mockEnvLookup(envMap)
+
+	t.Run("empty RETRIEVE_DRIVER returns nil", func(t *testing.T) {
+		stores := BuildEnvVectorStores("", lookup)
+		assert.Nil(t, stores)
+	})
+
+	t.Run("single driver postgres", func(t *testing.T) {
+		stores := BuildEnvVectorStores("postgres", lookup)
+		require.Len(t, stores, 1)
+		assert.Equal(t, "__env_postgres__", stores[0].ID)
+		assert.Equal(t, "PostgreSQL", stores[0].Name)
+		assert.Equal(t, PostgresRetrieverEngineType, stores[0].EngineType)
+		assert.True(t, stores[0].ConnectionConfig.UseDefaultConnection)
+	})
+
+	t.Run("multiple drivers", func(t *testing.T) {
+		stores := BuildEnvVectorStores("postgres,elasticsearch_v8", lookup)
+		require.Len(t, stores, 2)
+		assert.Equal(t, "__env_postgres__", stores[0].ID)
+		assert.Equal(t, "__env_elasticsearch_v8__", stores[1].ID)
+		assert.Equal(t, "http://es:9200", stores[1].ConnectionConfig.Addr)
+		assert.Equal(t, "elastic", stores[1].ConnectionConfig.Username)
+		assert.Equal(t, "secret", stores[1].ConnectionConfig.Password) // unmasked
+		assert.Equal(t, "my_index", stores[1].IndexConfig.IndexName)
+	})
+
+	t.Run("env store retains raw password (not masked)", func(t *testing.T) {
+		stores := BuildEnvVectorStores("elasticsearch_v8", lookup)
+		require.Len(t, stores, 1)
+		assert.Equal(t, "secret", stores[0].ConnectionConfig.Password)
+	})
+
+	t.Run("unknown driver is skipped", func(t *testing.T) {
+		stores := BuildEnvVectorStores("postgres,unknown_db", lookup)
+		require.Len(t, stores, 1)
+		assert.Equal(t, "__env_postgres__", stores[0].ID)
+	})
+
+	t.Run("whitespace trimmed", func(t *testing.T) {
+		stores := BuildEnvVectorStores(" postgres , elasticsearch_v8 ", lookup)
+		require.Len(t, stores, 2)
+	})
+
+	t.Run("all supported drivers", func(t *testing.T) {
+		stores := BuildEnvVectorStores("postgres,sqlite,elasticsearch_v8,elasticsearch_v7,qdrant,milvus,weaviate", lookup)
+		require.Len(t, stores, 7)
+
+		ids := make([]string, len(stores))
+		for i, s := range stores {
+			ids[i] = s.ID
+		}
+		assert.Contains(t, ids, "__env_postgres__")
+		assert.Contains(t, ids, "__env_sqlite__")
+		assert.Contains(t, ids, "__env_elasticsearch_v8__")
+		assert.Contains(t, ids, "__env_elasticsearch_v7__")
+		assert.Contains(t, ids, "__env_qdrant__")
+		assert.Contains(t, ids, "__env_milvus__")
+		assert.Contains(t, ids, "__env_weaviate__")
+	})
+
+	t.Run("qdrant env store", func(t *testing.T) {
+		stores := BuildEnvVectorStores("qdrant", lookup)
+		require.Len(t, stores, 1)
+		assert.Equal(t, "qdrant-host", stores[0].ConnectionConfig.Host)
+		assert.Equal(t, "qd-key", stores[0].ConnectionConfig.APIKey)
+	})
+
+	t.Run("milvus env store", func(t *testing.T) {
+		stores := BuildEnvVectorStores("milvus", lookup)
+		require.Len(t, stores, 1)
+		assert.Equal(t, "milvus:19530", stores[0].ConnectionConfig.Addr)
+	})
+
+	t.Run("weaviate env store", func(t *testing.T) {
+		stores := BuildEnvVectorStores("weaviate", lookup)
+		require.Len(t, stores, 1)
+		assert.Equal(t, "weaviate:8080", stores[0].ConnectionConfig.Host)
+	})
+}
+
+func TestFindEnvVectorStore(t *testing.T) {
+	lookup := mockEnvLookup(map[string]string{})
+
+	t.Run("found", func(t *testing.T) {
+		store := FindEnvVectorStore("postgres", lookup, "__env_postgres__")
+		require.NotNil(t, store)
+		assert.Equal(t, "__env_postgres__", store.ID)
+	})
+
+	t.Run("not found", func(t *testing.T) {
+		store := FindEnvVectorStore("postgres", lookup, "__env_unknown__")
+		assert.Nil(t, store)
+	})
+
+	t.Run("empty driver returns nil", func(t *testing.T) {
+		store := FindEnvVectorStore("", lookup, "__env_postgres__")
+		assert.Nil(t, store)
+	})
+}
+
+func TestNewVectorStoreResponse(t *testing.T) {
+	store := &VectorStore{
+		ID:         "test-id",
+		Name:       "test-store",
+		EngineType: ElasticsearchRetrieverEngineType,
+		ConnectionConfig: ConnectionConfig{
+			Addr:     "http://es:9200",
+			Password: "secret",
+			APIKey:   "my-api-key",
+		},
+	}
+
+	t.Run("masks sensitive fields", func(t *testing.T) {
+		resp := NewVectorStoreResponse(store, "user", false)
+		assert.Equal(t, "***", resp.ConnectionConfig.Password)
+		assert.Equal(t, "***", resp.ConnectionConfig.APIKey)
+		assert.Equal(t, "http://es:9200", resp.ConnectionConfig.Addr) // non-sensitive preserved
+	})
+
+	t.Run("preserves source and readonly", func(t *testing.T) {
+		resp := NewVectorStoreResponse(store, "env", true)
+		assert.Equal(t, "env", resp.Source)
+		assert.True(t, resp.ReadOnly)
+	})
+
+	t.Run("does not mutate original store", func(t *testing.T) {
+		_ = NewVectorStoreResponse(store, "user", false)
+		assert.Equal(t, "secret", store.ConnectionConfig.Password)
+		assert.Equal(t, "my-api-key", store.ConnectionConfig.APIKey)
+	})
+
+	t.Run("empty sensitive fields not masked to ***", func(t *testing.T) {
+		noSecret := &VectorStore{
+			ID:               "test-id",
+			ConnectionConfig: ConnectionConfig{Addr: "http://es:9200"},
+		}
+		resp := NewVectorStoreResponse(noSecret, "user", false)
+		assert.Equal(t, "", resp.ConnectionConfig.Password)
+		assert.Equal(t, "", resp.ConnectionConfig.APIKey)
+	})
+}
+
+func TestGetVectorStoreTypes(t *testing.T) {
+	types := GetVectorStoreTypes()
+
+	t.Run("returns 4 engine types (excludes postgres and sqlite)", func(t *testing.T) {
+		assert.Len(t, types, 4)
+	})
+
+	t.Run("type names match engine constants", func(t *testing.T) {
+		typeNames := make([]string, len(types))
+		for i, typ := range types {
+			typeNames[i] = typ.Type
+		}
+		assert.Contains(t, typeNames, "elasticsearch")
+		assert.Contains(t, typeNames, "qdrant")
+		assert.Contains(t, typeNames, "milvus")
+		assert.Contains(t, typeNames, "weaviate")
+		assert.NotContains(t, typeNames, "postgres")
+		assert.NotContains(t, typeNames, "sqlite")
+	})
+
+	t.Run("elasticsearch has connection and index fields", func(t *testing.T) {
+		var esType VectorStoreTypeInfo
+		for _, typ := range types {
+			if typ.Type == "elasticsearch" {
+				esType = typ
+				break
+			}
+		}
+		assert.NotEmpty(t, esType.ConnectionFields)
+		assert.NotEmpty(t, esType.IndexFields)
+
+		// Check sensitive field marking
+		var passwordField VectorStoreFieldInfo
+		for _, f := range esType.ConnectionFields {
+			if f.Name == "password" {
+				passwordField = f
+				break
+			}
+		}
+		assert.True(t, passwordField.Sensitive)
+	})
+
+	t.Run("display names have no parenthetical suffix", func(t *testing.T) {
+		for _, typ := range types {
+			assert.NotContains(t, typ.DisplayName, "(", "display_name should not contain parenthetical suffix: %s", typ.DisplayName)
+		}
+	})
+}
+
 // testAESKey is a 32-byte key for testing AES-GCM encryption.
 const testAESKey = "01234567890123456789012345678901"
 
@@ -383,7 +617,7 @@ func TestIndexConfig_GetIndexNameOrDefault(t *testing.T) {
 			name:       "weaviate default",
 			config:     IndexConfig{},
 			engineType: WeaviateRetrieverEngineType,
-			expected:   "WeKnora",
+			expected:   "Weknora_embeddings",
 		},
 		// Postgres (no index config)
 		{
@@ -405,4 +639,302 @@ func TestIndexConfig_GetIndexNameOrDefault(t *testing.T) {
 			assert.Equal(t, tt.expected, tt.config.GetIndexNameOrDefault(tt.engineType))
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// IndexConfig — getter helpers
+// ---------------------------------------------------------------------------
+
+func TestIndexConfig_GetterHelpers(t *testing.T) {
+	t.Run("nil receiver returns default", func(t *testing.T) {
+		var ic *IndexConfig
+		assert.Equal(t, 5, ic.GetNumberOfShards(5))
+		assert.Equal(t, -1, ic.GetNumberOfReplicas(-1))
+		assert.Equal(t, 0, ic.GetShardNumber(0))
+		assert.Equal(t, 0, ic.GetReplicationFactor(0))
+		assert.Equal(t, 1, ic.GetShardsNum(1))
+		assert.Equal(t, 0, ic.GetReplicaNumber(0))
+		assert.Equal(t, 0, ic.GetDesiredShardCount(0))
+	})
+
+	t.Run("zero value returns default", func(t *testing.T) {
+		ic := &IndexConfig{}
+		assert.Equal(t, 5, ic.GetNumberOfShards(5))
+		assert.Equal(t, -1, ic.GetNumberOfReplicas(-1))
+		assert.Equal(t, 0, ic.GetShardNumber(0))
+		assert.Equal(t, 0, ic.GetReplicationFactor(0))
+		assert.Equal(t, 1, ic.GetShardsNum(1))
+		assert.Equal(t, 0, ic.GetReplicaNumber(0))
+		assert.Equal(t, 0, ic.GetDesiredShardCount(0))
+	})
+
+	t.Run("positive value overrides default", func(t *testing.T) {
+		ic := &IndexConfig{
+			NumberOfShards:    3,
+			NumberOfReplicas:  2,
+			ShardNumber:       4,
+			ReplicationFactor: 3,
+			ShardsNum:         5,
+			ReplicaNumber:     2,
+			DesiredShardCount: 3,
+		}
+		assert.Equal(t, 3, ic.GetNumberOfShards(1))
+		assert.Equal(t, 2, ic.GetNumberOfReplicas(-1))
+		assert.Equal(t, 4, ic.GetShardNumber(0))
+		assert.Equal(t, 3, ic.GetReplicationFactor(0))
+		assert.Equal(t, 5, ic.GetShardsNum(1))
+		assert.Equal(t, 2, ic.GetReplicaNumber(0))
+		assert.Equal(t, 3, ic.GetDesiredShardCount(0))
+	})
+
+	t.Run("negative value returns default (treated as unset)", func(t *testing.T) {
+		ic := &IndexConfig{
+			NumberOfShards:    -1,
+			NumberOfReplicas:  -1,
+			ShardNumber:       -5,
+			ReplicationFactor: -1,
+			ShardsNum:         -1,
+			ReplicaNumber:     -1,
+			DesiredShardCount: -1,
+		}
+		assert.Equal(t, 1, ic.GetNumberOfShards(1))
+		assert.Equal(t, -1, ic.GetNumberOfReplicas(-1))
+		assert.Equal(t, 0, ic.GetShardNumber(0))
+		assert.Equal(t, 0, ic.GetReplicationFactor(0))
+		assert.Equal(t, 1, ic.GetShardsNum(1))
+		assert.Equal(t, 0, ic.GetReplicaNumber(0))
+		assert.Equal(t, 0, ic.GetDesiredShardCount(0))
+	})
+}
+
+// ---------------------------------------------------------------------------
+// IndexConfig — resolve helpers
+// ---------------------------------------------------------------------------
+
+func TestResolveIndexName(t *testing.T) {
+	t.Run("nil IndexConfig falls back to env var", func(t *testing.T) {
+		t.Setenv("ELASTICSEARCH_INDEX", "env_index")
+		assert.Equal(t, "env_index", ResolveIndexName(nil, "ELASTICSEARCH_INDEX", "default"))
+	})
+
+	t.Run("nil IndexConfig falls back to default when env empty", func(t *testing.T) {
+		t.Setenv("ELASTICSEARCH_INDEX", "")
+		assert.Equal(t, "xwrag_default", ResolveIndexName(nil, "ELASTICSEARCH_INDEX", "xwrag_default"))
+	})
+
+	t.Run("IndexConfig value takes precedence over env var", func(t *testing.T) {
+		t.Setenv("ELASTICSEARCH_INDEX", "env_index")
+		ic := &IndexConfig{IndexName: "custom_index"}
+		assert.Equal(t, "custom_index", ResolveIndexName(ic, "ELASTICSEARCH_INDEX", "default"))
+	})
+
+	t.Run("empty IndexConfig.IndexName falls back to env var", func(t *testing.T) {
+		t.Setenv("ELASTICSEARCH_INDEX", "env_index")
+		ic := &IndexConfig{}
+		assert.Equal(t, "env_index", ResolveIndexName(ic, "ELASTICSEARCH_INDEX", "default"))
+	})
+}
+
+func TestResolveCollectionName(t *testing.T) {
+	t.Run("nil IndexConfig falls back to env var", func(t *testing.T) {
+		t.Setenv("QDRANT_COLLECTION", "env_collection")
+		assert.Equal(t, "env_collection", ResolveCollectionName(nil, "QDRANT_COLLECTION", "default"))
+	})
+
+	t.Run("CollectionPrefix takes precedence over CollectionName", func(t *testing.T) {
+		ic := &IndexConfig{CollectionPrefix: "prefix_name", CollectionName: "full_name"}
+		assert.Equal(t, "prefix_name", ResolveCollectionName(ic, "QDRANT_COLLECTION", "default"))
+	})
+
+	t.Run("CollectionName used when CollectionPrefix empty", func(t *testing.T) {
+		ic := &IndexConfig{CollectionName: "full_name"}
+		assert.Equal(t, "full_name", ResolveCollectionName(ic, "MILVUS_COLLECTION", "default"))
+	})
+
+	t.Run("empty IndexConfig falls back to default", func(t *testing.T) {
+		t.Setenv("QDRANT_COLLECTION", "")
+		ic := &IndexConfig{}
+		assert.Equal(t, "weknora_embeddings", ResolveCollectionName(ic, "QDRANT_COLLECTION", "weknora_embeddings"))
+	})
+}
+
+// ---------------------------------------------------------------------------
+// OptionalUint32
+// ---------------------------------------------------------------------------
+
+func TestOptionalUint32(t *testing.T) {
+	t.Run("zero returns nil", func(t *testing.T) {
+		assert.Nil(t, OptionalUint32(0))
+	})
+
+	t.Run("negative returns nil", func(t *testing.T) {
+		assert.Nil(t, OptionalUint32(-1))
+		assert.Nil(t, OptionalUint32(-100))
+	})
+
+	t.Run("positive returns pointer to uint32", func(t *testing.T) {
+		result := OptionalUint32(3)
+		require.NotNil(t, result)
+		assert.Equal(t, uint32(3), *result)
+	})
+
+	t.Run("large positive value", func(t *testing.T) {
+		result := OptionalUint32(64)
+		require.NotNil(t, result)
+		assert.Equal(t, uint32(64), *result)
+	})
+}
+
+// ---------------------------------------------------------------------------
+// ValidateIndexConfig
+// ---------------------------------------------------------------------------
+
+func TestValidateIndexConfig(t *testing.T) {
+	t.Run("empty config is valid", func(t *testing.T) {
+		assert.NoError(t, ValidateIndexConfig(IndexConfig{}))
+	})
+
+	t.Run("valid config with all fields", func(t *testing.T) {
+		ic := IndexConfig{
+			IndexName:         "my_index",
+			NumberOfShards:    3,
+			NumberOfReplicas:  1,
+			CollectionPrefix:  "my_collection",
+			ShardNumber:       4,
+			ReplicationFactor: 2,
+			ShardsNum:         2,
+			ReplicaNumber:     3,
+			DesiredShardCount: 2,
+		}
+		assert.NoError(t, ValidateIndexConfig(ic))
+	})
+
+	// --- Name validation ---
+	t.Run("index_name with special chars rejected", func(t *testing.T) {
+		ic := IndexConfig{IndexName: "my index*"}
+		err := ValidateIndexConfig(ic)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "index_name")
+	})
+
+	t.Run("index_name starting with number rejected", func(t *testing.T) {
+		ic := IndexConfig{IndexName: "123abc"}
+		err := ValidateIndexConfig(ic)
+		require.Error(t, err)
+	})
+
+	t.Run("collection_prefix with slash rejected", func(t *testing.T) {
+		ic := IndexConfig{CollectionPrefix: "path/to/collection"}
+		err := ValidateIndexConfig(ic)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "collection_prefix")
+	})
+
+	t.Run("collection_name with dot rejected", func(t *testing.T) {
+		ic := IndexConfig{CollectionName: "my.collection"}
+		err := ValidateIndexConfig(ic)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "collection_name")
+	})
+
+	t.Run("valid names with underscore and hyphen", func(t *testing.T) {
+		ic := IndexConfig{
+			IndexName:        "my_index-v2",
+			CollectionPrefix: "Weknora_embeddings",
+			CollectionName:   "custom-collection-name",
+		}
+		assert.NoError(t, ValidateIndexConfig(ic))
+	})
+
+	// --- Numeric bounds ---
+	t.Run("number_of_shards exceeds max", func(t *testing.T) {
+		ic := IndexConfig{NumberOfShards: 100}
+		err := ValidateIndexConfig(ic)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "number_of_shards")
+	})
+
+	t.Run("negative number_of_shards rejected", func(t *testing.T) {
+		ic := IndexConfig{NumberOfShards: -1}
+		err := ValidateIndexConfig(ic)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "number_of_shards")
+	})
+
+	t.Run("replication_factor exceeds max", func(t *testing.T) {
+		ic := IndexConfig{ReplicationFactor: 50}
+		err := ValidateIndexConfig(ic)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "replication_factor")
+	})
+
+	t.Run("shard_number at max boundary is valid", func(t *testing.T) {
+		ic := IndexConfig{ShardNumber: 64}
+		assert.NoError(t, ValidateIndexConfig(ic))
+	})
+
+	t.Run("replication_factor at max boundary is valid", func(t *testing.T) {
+		ic := IndexConfig{ReplicationFactor: 10}
+		assert.NoError(t, ValidateIndexConfig(ic))
+	})
+
+	t.Run("shards_num exceeds max", func(t *testing.T) {
+		ic := IndexConfig{ShardsNum: 999}
+		err := ValidateIndexConfig(ic)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "shards_num")
+	})
+
+	t.Run("replica_number exceeds max", func(t *testing.T) {
+		ic := IndexConfig{ReplicaNumber: 50}
+		err := ValidateIndexConfig(ic)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "replica_number")
+	})
+
+	t.Run("desired_shard_count exceeds max", func(t *testing.T) {
+		ic := IndexConfig{DesiredShardCount: 100}
+		err := ValidateIndexConfig(ic)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "desired_shard_count")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// IndexConfig — scalability fields round-trip
+// ---------------------------------------------------------------------------
+
+func TestIndexConfig_ScalabilityFieldsRoundTrip(t *testing.T) {
+	t.Run("scalability fields serialize and deserialize", func(t *testing.T) {
+		original := IndexConfig{
+			IndexName:         "my_index",
+			NumberOfShards:    3,
+			NumberOfReplicas:  1,
+			CollectionPrefix:  "my_prefix",
+			ShardNumber:       4,
+			ReplicationFactor: 2,
+			ShardsNum:         5,
+			ReplicaNumber:     3,
+			DesiredShardCount: 2,
+		}
+		raw, err := original.Value()
+		require.NoError(t, err)
+
+		var scanned IndexConfig
+		require.NoError(t, scanned.Scan(raw.([]byte)))
+		assert.Equal(t, original, scanned)
+	})
+
+	t.Run("scalability fields omitted when zero", func(t *testing.T) {
+		raw, err := IndexConfig{IndexName: "test"}.Value()
+		require.NoError(t, err)
+
+		var parsed map[string]interface{}
+		require.NoError(t, json.Unmarshal(raw.([]byte), &parsed))
+		assert.NotContains(t, parsed, "shard_number")
+		assert.NotContains(t, parsed, "replication_factor")
+		assert.NotContains(t, parsed, "shards_num")
+		assert.NotContains(t, parsed, "replica_number")
+		assert.NotContains(t, parsed, "desired_shard_count")
+	})
 }

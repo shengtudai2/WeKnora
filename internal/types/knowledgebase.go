@@ -66,6 +66,13 @@ type KnowledgeBase struct {
 	StorageProviderConfig *StorageProviderConfig `yaml:"storage_provider_config" json:"storage_provider_config"  gorm:"column:storage_provider_config;type:jsonb"`
 	// Deprecated: legacy COS config column. Kept for backward compatibility with old data.
 	StorageConfig StorageConfig `yaml:"-" json:"storage_config" gorm:"column:cos_config;type:json"`
+	// VectorStoreID references the VectorStore this knowledge base is bound to.
+	// When nil, the KB falls back to the tenant's effective engines derived from
+	// the RETRIEVE_DRIVER environment variable (env store flow).
+	// This field is set once at creation time and must not be modified afterwards;
+	// enforcement lives at the GORM layer (`<-:create`) plus the service-layer
+	// KB update path, which omits this field from its update DTO.
+	VectorStoreID *string `yaml:"vector_store_id"         json:"vector_store_id,omitempty" gorm:"column:vector_store_id;type:varchar(36);<-:create"`
 	// Extract config
 	ExtractConfig *ExtractConfig `yaml:"extract_config"          json:"extract_config"          gorm:"column:extract_config;type:json"`
 	// FAQConfig stores FAQ specific configuration such as indexing strategy
@@ -152,7 +159,7 @@ func (c ChunkingConfig) ResolveParserEngine(fileType string) string {
 // StorageProviderConfig stores the KB-level storage provider selection.
 // Credentials are managed at the tenant level (StorageEngineConfig).
 type StorageProviderConfig struct {
-	Provider string `yaml:"provider" json:"provider"` // "local", "minio", "cos", "tos"
+	Provider string `yaml:"provider" json:"provider"` // "local", "minio", "cos", "tos", "s3", "oss"
 }
 
 func (c StorageProviderConfig) Value() (driver.Value, error) {
@@ -266,7 +273,7 @@ func InferStorageFromFilePath(filePath string) string {
 // e.g. "minio://bucket/key" → "minio", "local://tenant/file.pdf" → "local"
 // Returns "" if the path does not use a known provider scheme.
 func ParseProviderScheme(filePath string) string {
-	for _, provider := range []string{"local", "minio", "cos", "tos", "s3"} {
+	for _, provider := range []string{"local", "minio", "cos", "tos", "s3", "oss"} {
 		if strings.HasPrefix(filePath, provider+"://") {
 			return provider
 		}

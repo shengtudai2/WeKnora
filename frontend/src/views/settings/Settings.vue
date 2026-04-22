@@ -27,11 +27,11 @@
                     @click="handleNavClick(item)"
                   >
                     <!-- 网络搜索使用自定义 SVG 图标 -->
-                    <svg 
+                    <svg
                       v-if="item.key === 'websearch'"
-                      width="18" 
-                      height="18" 
-                      viewBox="0 0 18 18" 
+                      width="18"
+                      height="18"
+                      viewBox="0 0 18 18"
                       fill="none"
                       xmlns="http://www.w3.org/2000/svg"
                       class="nav-icon"
@@ -41,6 +41,19 @@
                       <path d="M 9 2 A 3.5 7 0 0 1 9 16" stroke="currentColor" stroke-width="1.2" fill="none"/>
                       <line x1="2.94" y1="5.5" x2="15.06" y2="5.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
                       <line x1="2.94" y1="12.5" x2="15.06" y2="12.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+                    </svg>
+                    <!-- WeKnora Cloud 使用自定义 W 图标 -->
+                    <svg
+                      v-else-if="item.key === 'weknoracloud'"
+                      width="18"
+                      height="18"
+                      viewBox="0 0 18 18"
+                      fill="none"
+                      xmlns="http://www.w3.org/2000/svg"
+                      class="nav-icon"
+                    >
+                      <rect x="1.5" y="1.5" width="15" height="15" rx="3.5" stroke="currentColor" stroke-width="1.2" fill="none"/>
+                      <path d="M4.5 5.5L6.5 12.5L9 7.5L11.5 12.5L13.5 5.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
                     </svg>
                     <t-icon v-else :name="item.icon" class="nav-icon" />
                     <span class="nav-label">{{ item.label }}</span>
@@ -79,14 +92,19 @@
                   <GeneralSettings />
                 </div>
 
-                <!-- 模型配置 -->
-                <div v-if="currentSection === 'models'" class="section">
-                  <ModelSettings />
-                </div>
-
                 <!-- Ollama 设置 -->
                 <div v-if="currentSection === 'ollama'" class="section">
                   <OllamaSettings />
+                </div>
+
+                <!-- WeKnora Cloud -->
+                <div v-if="currentSection === 'weknoracloud'" class="section">
+                  <WeKnoraCloudSettings />
+                </div>
+
+                <!-- 模型配置 -->
+                <div v-if="currentSection === 'models'" class="section">
+                  <ModelSettings />
                 </div>
 
                 <!-- 网络搜索配置 -->
@@ -97,6 +115,11 @@
                 <!-- 消息管理 -->
                 <div v-if="currentSection === 'chathistory'" class="section">
                   <ChatHistorySettings />
+                </div>
+
+                <!-- 向量数据库引擎 -->
+                <div v-if="currentSection === 'vectorstore'" class="section">
+                  <VectorStoreSettings />
                 </div>
 
                 <!-- 解析引擎 -->
@@ -151,8 +174,10 @@ import OllamaSettings from './OllamaSettings.vue'
 import McpSettings from './McpSettings.vue'
 import WebSearchSettings from './WebSearchSettings.vue'
 import ChatHistorySettings from './ChatHistorySettings.vue'
+import VectorStoreSettings from './VectorStoreSettings.vue'
 import ParserEngineSettings from './ParserEngineSettings.vue'
 import StorageEngineSettings from './StorageEngineSettings.vue'
+import WeKnoraCloudSettings from './WeKnoraCloudSettings.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -165,44 +190,14 @@ const expandedMenus = ref<string[]>([])
 
 const navItems = computed(() => [
   { key: 'general', icon: 'setting', label: t('general.title') },
-  { 
-    key: 'models', 
-    icon: 'control-platform', 
-    label: t('settings.modelManagement'),
-    children: [
-      { key: 'chat', label: t('model.llmModel') },
-      { key: 'embedding', label: t('model.embeddingModel') },
-      { key: 'rerank', label: t('model.rerankModel') },
-      { key: 'vllm', label: t('model.vlmModel') }
-    ]
-  },
   { key: 'ollama', icon: 'server', label: 'Ollama' },
-  { key: 'websearch', icon: 'search', label: t('settings.webSearchConfig')  },
+  { key: 'weknoracloud', icon: '', label: 'WeKnora Cloud' },
+  { key: 'models', icon: 'control-platform', label: t('settings.modelManagement') },
+   { key: 'websearch', icon: 'search', label: t('settings.webSearchConfig')  },
   { key: 'chathistory', icon: 'chat', label: t('chatHistorySettings.title') },
-  {
-    key: 'parser',
-    icon: 'file-search',
-    label: t('settings.parserEngine'),
-    children: [
-      { key: 'builtin', label: 'Builtin (DocReader)' },
-      { key: 'simple', label: 'Simple' },
-      { key: 'markitdown', label: 'Markitdown' },
-      { key: 'mineru', label: 'MinerU' },
-      { key: 'mineru_cloud', label: 'MinerU Cloud' },
-    ]
-  },
-  {
-    key: 'storage',
-    icon: 'cloud',
-    label: t('settings.storageEngine'),
-    children: [
-      { key: 'local', label: 'Local' },
-      { key: 'minio', label: 'MinIO' },
-      { key: 'cos', label: t('settings.storage.cos') },
-      { key: 'tos', label: t('settings.storage.tos') },
-      { key: 's3', label: 'AWS S3' },
-    ]
-  },
+  { key: 'vectorstore', icon: 'data-base', label: t('settings.vectorStoreEngine') },
+  { key: 'parser', icon: 'file-search', label: t('settings.parserEngine') },
+  { key: 'storage', icon: 'cloud', label: t('settings.storageEngine') },
   { key: 'mcp', icon: 'tools', label: t('settings.mcpService') },
   { key: 'system', icon: 'info-circle', label: t('settings.systemSettings') },
   { key: 'tenant', icon: 'user-circle', label: t('settings.tenantInfo') },

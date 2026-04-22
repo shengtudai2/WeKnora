@@ -38,7 +38,7 @@ type SplitterConfig struct {
 func DefaultConfig() SplitterConfig {
 	return SplitterConfig{
 		ChunkSize:    512,
-		ChunkOverlap: 128,
+		ChunkOverlap: 64,
 		Separators:   []string{"\n\n", "\n", "。"},
 	}
 }
@@ -519,10 +519,18 @@ func SplitTextParentChild(text string, parentCfg, childCfg SplitterConfig) Paren
 		return ParentChildResult{}
 	}
 
+	var newParents []Chunk
 	var children []ChildChunk
 	childSeq := 0
-	for pi, parent := range parents {
+	for _, parent := range parents {
 		subs := SplitText(parent.Content, childCfg)
+
+		parentIndex := -1
+		if len(subs) > 1 || (len(subs) == 1 && subs[0].Content != parent.Content) {
+			parentIndex = len(newParents)
+			newParents = append(newParents, parent)
+		}
+
 		for _, sub := range subs {
 			// Adjust offsets: sub positions are relative to parent content,
 			// shift to document-level offsets.
@@ -533,12 +541,12 @@ func SplitTextParentChild(text string, parentCfg, childCfg SplitterConfig) Paren
 			sub.End += parent.Start
 			children = append(children, ChildChunk{
 				Chunk:       sub,
-				ParentIndex: pi,
+				ParentIndex: parentIndex,
 			})
 			childSeq++
 		}
 	}
-	return ParentChildResult{Parents: parents, Children: children}
+	return ParentChildResult{Parents: newParents, Children: children}
 }
 
 // ExtractImageRefs extracts markdown image references from text.

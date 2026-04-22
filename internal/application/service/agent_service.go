@@ -110,7 +110,7 @@ func (s *agentService) CreateAgentEngine(
 
 	// 4. Resolve system prompt template
 	systemPromptTemplate := ""
-	if config.UseCustomSystemPrompt {
+	if config.UseCustomSystemPrompt || config.SystemPrompt != "" {
 		systemPromptTemplate = config.ResolveSystemPrompt(config.WebSearchEnabled)
 	}
 
@@ -128,7 +128,9 @@ func (s *agentService) CreateAgentEngine(
 	// reliably support images in tool role messages across providers).
 	if config.VLMModelID != "" {
 		if vlmModel, err := s.modelService.GetVLMModel(ctx, config.VLMModelID); err == nil {
-			engine.SetImageDescriber(vlmModel.Predict)
+			engine.SetImageDescriber(func(ctx context.Context, imgBytes []byte, prompt string) (string, error) {
+				return vlmModel.Predict(ctx, [][]byte{imgBytes}, prompt)
+			})
 			logger.Infof(ctx, "VLM image describer set for MCP tool result analysis (model: %s)", config.VLMModelID)
 		} else {
 			logger.Warnf(ctx, "Failed to load VLM model %s for MCP image fallback: %v", config.VLMModelID, err)

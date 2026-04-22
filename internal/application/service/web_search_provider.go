@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	infra_web_search "github.com/Tencent/WeKnora/internal/infrastructure/web_search"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -60,6 +61,12 @@ func (s *webSearchProviderService) UpdateProvider(ctx context.Context, provider 
 		}
 	}
 
+	if provider.Provider != "" {
+		if err := validateProviderParameters(provider.Provider, provider.Parameters); err != nil {
+			return err
+		}
+	}
+
 	logger.Infof(ctx, "Updating web search provider: tenant=%d, id=%s", provider.TenantID, provider.ID)
 	return s.repo.Update(ctx, provider)
 }
@@ -76,7 +83,9 @@ func isValidProviderType(provider types.WebSearchProviderType) bool {
 	case types.WebSearchProviderTypeBing,
 		types.WebSearchProviderTypeGoogle,
 		types.WebSearchProviderTypeDuckDuckGo,
-		types.WebSearchProviderTypeTavily:
+		types.WebSearchProviderTypeTavily,
+		types.WebSearchProviderTypeOllama,
+		types.WebSearchProviderTypeBaidu:
 		return true
 	default:
 		return false
@@ -101,8 +110,23 @@ func validateProviderParameters(provider types.WebSearchProviderType, params typ
 		if params.APIKey == "" {
 			return fmt.Errorf("API key is required for Tavily provider")
 		}
+	case types.WebSearchProviderTypeOllama:
+		if params.APIKey == "" {
+			return fmt.Errorf("API key is required for Ollama provider")
+		}
+	case types.WebSearchProviderTypeBaidu:
+		if params.APIKey == "" {
+			return fmt.Errorf("API key is required for Baidu provider")
+		}
 	case types.WebSearchProviderTypeDuckDuckGo:
 		// No API key required
 	}
+	if err := validateOptionalProxyURL(params.ProxyURL); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateOptionalProxyURL(proxyURL string) error {
+	return infra_web_search.ValidateProxyURL(proxyURL)
 }
