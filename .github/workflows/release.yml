@@ -1,0 +1,206 @@
+name: Build and Release Docker Images
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  # ── 获取版本号 ──
+  get-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+          echo "Release tag: ${TAG}, version: ${TAG#v}"
+
+  # ── 构建所有镜像（矩阵：4 组件 × 2 架构） ──
+  build:
+    needs: get-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Frontend (Nginx)
+          - component: ui
+            dockerfile: frontend/Dockerfile
+            context: ./frontend
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - component: ui
+            dockerfile: frontend/Dockerfile
+            context: ./frontend
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+          # Docreader (Python gRPC)
+          - component: docreader
+            dockerfile: docker/Dockerfile.docreader
+            context: .
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - component: docreader
+            dockerfile: docker/Dockerfile.docreader
+            context: .
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+          # Sandbox (Agent skill executor)
+          - component: sandbox
+            dockerfile: docker/Dockerfile.sandbox
+            context: .
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - component: sandbox
+            dockerfile: docker/Dockerfile.sandbox
+            context: .
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+          # App (Go backend)
+          - component: app
+            dockerfile: docker/Dockerfile.app
+            context: .
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - component: app
+            dockerfile: docker/Dockerfile.app
+            context: .
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Prepare build args
+        id: prep
+        run: |
+          # 提取架构名
+          ARCH="${{ matrix.platform }}"
+          echo "arch=${ARCH#linux/}" >> "$GITHUB_OUTPUT"
+
+          # 仅 app 组件需要版本信息构建参数
+          if [ "${{ matrix.component }}" = "app" ]; then
+            {
+              echo "version_arg=VERSION_ARG=${{ needs.get-version.outputs.version }}"
+              echo "commit_arg=COMMIT_ID_ARG=${GITHUB_SHA:0:8}"
+              echo "build_time_arg=BUILD_TIME_ARG=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+              echo "go_version_arg=GO_VERSION_ARG=1.24"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          push: false
+          load: true
+          platforms: ${{ matrix.platform }}
+          file: ${{ matrix.dockerfile }}
+          context: ${{ matrix.context }}
+          tags: weknora-${{ matrix.component }}:${{ needs.get-version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            ${{ steps.prep.outputs.version_arg }}
+            ${{ steps.prep.outputs.commit_arg }}
+            ${{ steps.prep.outputs.build_time_arg }}
+            ${{ steps.prep.outputs.go_version_arg }}
+
+      - name: Save image as .tar.gz
+        run: |
+          VERSION="${{ needs.get-version.outputs.version }}"
+          ARCH="${{ steps.prep.outputs.arch }}"
+          IMAGE="weknora-${{ matrix.component }}"
+          FILENAME="${IMAGE}-${VERSION}-linux-${ARCH}.tar"
+
+          docker save "${IMAGE}:${VERSION}" -o "${FILENAME}"
+          gzip "${FILENAME}"
+
+          echo "✅ Saved ${FILENAME}.gz ($(du -h "${FILENAME}.gz" | cut -f1))"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: weknora-${{ matrix.component }}-${{ steps.prep.outputs.arch }}
+          path: weknora-${{ matrix.component }}-${{ needs.get-version.outputs.version }}-linux-${{ steps.prep.outputs.arch }}.tar.gz
+          retention-days: 1
+
+  # ── 创建 GitHub Release 并上传所有镜像 ──
+  release:
+    needs: [get-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List image files
+        run: |
+          echo "## 镜像文件列表" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          ls -lh artifacts/
+          echo "" >> $GITHUB_STEP_SUMMARY
+          for f in artifacts/*.tar.gz; do
+            SIZE=$(du -h "$f" | cut -f1)
+            echo "- \`$(basename $f)\` (${SIZE})" >> $GITHUB_STEP_SUMMARY
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.get-version.outputs.tag }}
+          files: artifacts/*.tar.gz
+          generate_release_notes: true
+          body: |
+            ## Docker 镜像
+
+            ### 使用方法
+
+            下载对应架构的镜像文件后，使用以下命令加载：
+
+            ```bash
+            docker load -i weknora-<组件>-<版本>-linux-<架构>.tar.gz
+            ```
+
+            ### 组件说明
+
+            | 组件 | 文件 | 说明 |
+            |------|------|------|
+            | Frontend | `weknora-ui-*` | 前端 (Nginx) |
+            | App | `weknora-app-*` | 后端服务 (Go) |
+            | Docreader | `weknora-docreader-*` | 文档解析 (Python gRPC) |
+            | Sandbox | `weknora-sandbox-*` | Agent 沙箱执行环境 |
+
+            ### 架构
+
+            - `amd64` — x86_64 (绝大多数服务器/PC)
+            - `arm64` — ARM 64位 (Apple Silicon、AWS Graviton、树莓派5等)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
